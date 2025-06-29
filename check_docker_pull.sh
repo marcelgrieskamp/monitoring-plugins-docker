@@ -67,16 +67,24 @@ get_remote_digest() {
     local remote_digest=""
     
     # Try docker manifest inspect first
-    if remote_digest=$($DOCKER_CMD manifest inspect "$image" 2>/dev/null | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4); then
-        echo "$remote_digest"
-        return 0
+    local manifest_output
+    if manifest_output=$($DOCKER_CMD manifest inspect "$image" 2>/dev/null); then
+        remote_digest=$(echo "$manifest_output" | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4 2>/dev/null || echo "")
+        if [ -n "$remote_digest" ]; then
+            echo "$remote_digest"
+            return 0
+        fi
     fi
     
     # Fallback: try skopeo if available
     if command -v skopeo &> /dev/null; then
-        if remote_digest=$(skopeo inspect "docker://$image" 2>/dev/null | grep -o '"Digest":"sha256:[a-f0-9]*"' | cut -d'"' -f4); then
-            echo "$remote_digest"
-            return 0
+        local skopeo_output
+        if skopeo_output=$(skopeo inspect "docker://$image" 2>/dev/null); then
+            remote_digest=$(echo "$skopeo_output" | grep -o '"Digest":"sha256:[a-f0-9]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            if [ -n "$remote_digest" ]; then
+                echo "$remote_digest"
+                return 0
+            fi
         fi
     fi
     
@@ -136,14 +144,18 @@ main() {
         echo "Checking container: $container_name (image: $image_name)" >&2
         
         # Skip if we already checked this image (avoid duplicates)
-        if echo "$checked_images" | grep -q "^${image_name}$"; then
+        if [ -n "$checked_images" ] && echo "$checked_images" | grep -q "^${image_name}$" 2>/dev/null; then
             echo "  -> Already checked this image, skipping" >&2
             continue
         fi
-        checked_images="$checked_images"$'\n'"$image_name"
+        if [ -z "$checked_images" ]; then
+            checked_images="$image_name"
+        else
+            checked_images="$checked_images"$'\n'"$image_name"
+        fi
         
         # Get local image digest
-        local_digest=$(get_local_digest "$image_name")
+        local_digest=$(get_local_digest "$image_name" || echo "")
         if [ -z "$local_digest" ]; then
             echo "  -> Warning: Cannot get local digest for $image_name" >&2
             failed_count=$((failed_count + 1))
@@ -153,7 +165,7 @@ main() {
         echo "  -> Local digest: ${local_digest:0:12}..." >&2
         
         # Get remote image digest
-        remote_digest=$(get_remote_digest "$image_name")
+        remote_digest=$(get_remote_digest "$image_name" || echo "")
         if [ -z "$remote_digest" ]; then
             echo "  -> Warning: Cannot get remote digest for $image_name" >&2
             failed_count=$((failed_count + 1))
@@ -162,13 +174,18 @@ main() {
         
         echo "  -> Remote digest: ${remote_digest:0:12}..." >&2
         
-        # Compare digests
-        if [ "$local_digest" != "$remote_digest" ]; then
-            echo "  -> UPDATE AVAILABLE!" >&2
-            echo "$container_name ($image_name)" >> "$updates_file"
-            update_count=$((update_count + 1))
+        # Compare digests (only if both are valid SHA256 hashes)
+        if [[ "$local_digest" =~ ^sha256:[a-f0-9]{64}$ ]] && [[ "$remote_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+            if [ "$local_digest" != "$remote_digest" ]; then
+                echo "  -> UPDATE AVAILABLE!" >&2
+                echo "$container_name ($image_name)" >> "$updates_file"
+                update_count=$((update_count + 1))
+            else
+                echo "  -> Up to date" >&2
+            fi
         else
-            echo "  -> Up to date" >&2
+            echo "  -> Warning: Invalid digest format for $image_name" >&2
+            failed_count=$((failed_count + 1))
         fi
         
     done < "$containers_file"
