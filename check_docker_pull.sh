@@ -2,210 +2,85 @@
 
 # Script for getting an overview about not up-to-date docker containers
 # Set variable "TRACE" to "1" for debugging.
-# Improved version with better error handling and accurate update detection
 
 # sudo permissions for the user (nagios)
-# nagios ALL=NOPASSWD: /usr/bin/docker ps *
-# nagios ALL=NOPASSWD: /usr/bin/docker images *
-# nagios ALL=NOPASSWD: /usr/bin/docker inspect *
-# nagios ALL=NOPASSWD: /usr/bin/docker manifest inspect *
+# nagios ALL=NOPASSWD: /usr/bin/docker pull *
+# nagios ALL=NOPASSWD: /usr/bin/docker ps -qa
+# nagios ALL=NOPASSWD: /usr/bin/docker images -q
+# nagios ALL=NOPASSWD: /usr/bin/docker inspect --format *
+# nagios ALL=NOPASSWD: /usr/bin/docker images -aq --no-trunc *
 
-# Configuration
-TIMEOUT=60
-TEMP_DIR=$(mktemp -d)
-
-# Cleanup function
-cleanup() {
-    rm -rf "$TEMP_DIR"
-}
-trap cleanup EXIT
-
-# Error handling - more specific than the original trap
-handle_error() {
-    local exit_code=$?
-    local line_no=$1
-    echo "CRITICAL - Error occurred at line $line_no (exit code: $exit_code)"
-    exit 2
-}
-
-# Set error handling but not as aggressive as the original
-set -o nounset
-set -o pipefail
-
-# Function to check if docker command is available
-check_docker_availability() {
-    if ! command -v docker &> /dev/null; then
-        echo "CRITICAL - Docker command not found"
-        exit 2
-    fi
-
-    # Test docker access (with or without sudo)
-    if sudo docker info &> /dev/null; then
-        DOCKER_CMD="sudo docker"
-    elif docker info &> /dev/null; then
-        DOCKER_CMD="docker"
-    else
-        echo "CRITICAL - Cannot access Docker daemon"
-        exit 2
-    fi
-}
-
-# Function to normalize image names
-normalize_image_name() {
-    local image="$1"
-    # Add :latest if no tag specified
-    if [[ "$image" != *":"* ]]; then
-        echo "${image}:latest"
-    else
-        echo "$image"
-    fi
-}
-
-# Function to get remote digest without pulling
-get_remote_digest() {
-    local image="$1"
-    local remote_digest=""
-    
-    # Try docker manifest inspect first
-    local manifest_output
-    if manifest_output=$($DOCKER_CMD manifest inspect "$image" 2>/dev/null); then
-        remote_digest=$(echo "$manifest_output" | grep -o '"digest":"sha256:[a-f0-9]*"' | head -1 | cut -d'"' -f4 2>/dev/null || echo "")
-        if [ -n "$remote_digest" ]; then
-            echo "$remote_digest"
-            return 0
+remove_prefix_if_domain_exists() {
+    url="$1"
+    # Check for pattern *.* before the first /
+    if [[ $url =~ ^[^/]*\.[a-zA-Z]{2,} ]]; then
+        parts=(${url//\// })
+        if [ ${#parts[@]} -gt 1 ]; then
+            echo "${url#*/}"
+        else
+            echo "$url"
         fi
+    else
+        echo "$url"
     fi
-    
-    # Fallback: try skopeo if available
-    if command -v skopeo &> /dev/null; then
-        local skopeo_output
-        if skopeo_output=$(skopeo inspect "docker://$image" 2>/dev/null); then
-            remote_digest=$(echo "$skopeo_output" | grep -o '"Digest":"sha256:[a-f0-9]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-            if [ -n "$remote_digest" ]; then
-                echo "$remote_digest"
-                return 0
-            fi
-        fi
-    fi
-    
-    return 1
-}
-
-# Function to get local image digest
-get_local_digest() {
-    local image="$1"
-    local digest
-    
-    # Get the repo digest of the local image
-    digest=$($DOCKER_CMD inspect "$image" --format='{{index .RepoDigests 0}}' 2>/dev/null)
-    
-    if [ -n "$digest" ] && [ "$digest" != "<no value>" ]; then
-        # Extract just the SHA256 part after @
-        echo "${digest#*@}"
-        return 0
-    fi
-    
-    return 1
 }
 
 main() {
-    trap 'handle_error $LINENO' ERR
-    
-    echo "Checking Docker container updates..." >&2
-    
-    # Check Docker availability
-    check_docker_availability
-    
-    # Get all running containers with their images
-    local containers_file="$TEMP_DIR/containers.txt"
-    local updates_file="$TEMP_DIR/updates.txt"
-    
-    # Get container info: ContainerName|ImageName
-    $DOCKER_CMD ps --format "{{.Names}}|{{.Image}}" > "$containers_file"
-    
-    if [ ! -s "$containers_file" ]; then
-        echo "OK - No running containers found"
-        exit 0
+    # FIX 1: Remove aggressive error trap that caused "ERROR - An error has occurred."
+    # Only set basic error handling without errexit
+    set -o nounset
+    set -o pipefail
+
+    # check for sudo:
+    if ! sudo /usr/bin/docker images -aq --no-trunc '*' >> /dev/null 2>&1; then
+        echo "CRITICAL - Cannot access Docker"
+        exit 2
     fi
-    
-    local checked_images=""
-    local update_count=0
-    local failed_count=0
-    local total_containers=0
-    
-    # Process each container
-    while IFS='|' read -r container_name image_name; do
-        [ -z "$container_name" ] && continue
-        total_containers=$((total_containers + 1))
-        
-        # Normalize image name
-        image_name=$(normalize_image_name "$image_name")
-        
-        echo "Checking container: $container_name (image: $image_name)" >&2
-        
-        # Skip if we already checked this image (avoid duplicates)
-        if [ -n "$checked_images" ] && echo "$checked_images" | grep -q "^${image_name}$" 2>/dev/null; then
-            echo "  -> Already checked this image, skipping" >&2
+
+    # Get unique repository:tag combinations to avoid duplicates
+    UNIQUE_REPOS=$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>" | sort -u)
+
+    # FIX 2: Instead of pulling all images, check each container individually
+    # This prevents false positives from pulled images
+    UPD=""
+    for CONTAINER in $(sudo docker ps -qa); do
+        NAME=$(sudo docker inspect --format '{{.Name}}' $CONTAINER | sed "s/\///g")
+        REPO=$(sudo docker inspect --format '{{.Config.Image}}' $CONTAINER)
+
+        # Remove the domain part if it exists.
+        REPO=$(remove_prefix_if_domain_exists "$REPO")
+
+        # Skip if we can't determine the repository
+        if [ -z "$REPO" ] || [ "$REPO" = "<none>" ]; then
             continue
         fi
-        if [ -z "$checked_images" ]; then
-            checked_images="$image_name"
-        else
-            checked_images="$checked_images"$'\n'"$image_name"
-        fi
+
+        # Get current running image ID
+        IMG_RUNNING=$(sudo docker inspect --format '{{.Image}}' $CONTAINER)
         
-        # Get local image digest
-        local_digest=$(get_local_digest "$image_name" || echo "")
-        if [ -z "$local_digest" ]; then
-            echo "  -> Warning: Cannot get local digest for $image_name" >&2
-            failed_count=$((failed_count + 1))
-            continue
-        fi
-        
-        echo "  -> Local digest: ${local_digest:0:12}..." >&2
-        
-        # Get remote image digest
-        remote_digest=$(get_remote_digest "$image_name" || echo "")
-        if [ -z "$remote_digest" ]; then
-            echo "  -> Warning: Cannot get remote digest for $image_name" >&2
-            failed_count=$((failed_count + 1))
-            continue
-        fi
-        
-        echo "  -> Remote digest: ${remote_digest:0:12}..." >&2
-        
-        # Compare digests (only if both are valid SHA256 hashes)
-        if [[ "$local_digest" =~ ^sha256:[a-f0-9]{64}$ ]] && [[ "$remote_digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-            if [ "$local_digest" != "$remote_digest" ]; then
-                echo "  -> UPDATE AVAILABLE!" >&2
-                echo "$container_name ($image_name)" >> "$updates_file"
-                update_count=$((update_count + 1))
-            else
-                echo "  -> Up to date" >&2
+        # Try to pull the image to check for updates (but don't output anything)
+        if sudo docker pull "$REPO" > /dev/null 2>&1; then
+            # Get the latest image ID after potential pull
+            IMG_LATEST=$(sudo docker images -aq --no-trunc "$REPO" | head -n1)
+
+            # Compare image IDs - only report if they differ
+            if [ -n "$IMG_LATEST" ] && [ "$IMG_RUNNING" != "$IMG_LATEST" ]; then
+                if [ -n "$UPD" ]; then
+                    UPD="${UPD}, ${NAME}"
+                else
+                    UPD="${NAME}"
+                fi
             fi
-        else
-            echo "  -> Warning: Invalid digest format for $image_name" >&2
-            failed_count=$((failed_count + 1))
         fi
-        
-    done < "$containers_file"
-    
-    # Generate output
-    if [ $update_count -eq 0 ] && [ $failed_count -eq 0 ]; then
-        echo "OK - All $total_containers container(s) are up to date"
+    done
+
+    if [ -n "$UPD" ]; then
+        echo "WARNING - Update available for these containers:"
+        echo "${UPD}"
+        exit 1
+    else
+        echo "OK - no updates needed"
         exit 0
-    elif [ $update_count -eq 0 ] && [ $failed_count -gt 0 ]; then
-        echo "WARNING - $failed_count container(s) could not be checked, but no updates found"
-        exit 1
-    elif [ $update_count -gt 0 ]; then
-        echo "WARNING - $update_count container(s) have updates available:"
-        if [ -s "$updates_file" ]; then
-            cat "$updates_file"
-        fi
-        if [ $failed_count -gt 0 ]; then
-            echo "Note: $failed_count container(s) could not be checked"
-        fi
-        exit 1
     fi
 }
 
